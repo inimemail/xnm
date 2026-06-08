@@ -265,7 +265,7 @@ print_managed_bindings() {
     ensure_state_dir
 
     if [ ! -s "$NAMES_FILE" ]; then
-        print_warn "还没有本脚本记录的节点名称。新添加节点后会自动显示在这里。"
+        print_warn "节点列表为空。可以先添加节点，或同步服务里已经运行的节点。"
         return 1
     fi
 
@@ -274,9 +274,10 @@ print_managed_bindings() {
     printf '%-4s %-18s %-8s %-10s %-9s %-14s %s\n' "----" "------------------" "--------" "----------" "---------" "--------------" "----------------"
     awk -F '\t' '
         NF >= 5 {
+            idx++;
             label=$1; kind=$2; panel=$3; target_id=$4; kernel=$5; node_type=$6;
             if (node_type == "") node_type="-";
-            printf "%-4d %-18s %-8s %-10s %-9s %-14s %s\n", NR, label, kind, target_id, kernel, node_type, panel
+            printf "%-4d %-18s %-8s %-10s %-9s %-14s %s\n", idx, label, kind, target_id, kernel, node_type, panel
         }
     ' "$NAMES_FILE"
 }
@@ -290,7 +291,7 @@ read_binding_by_index() {
     echo ""
     read_positive_int "$prompt" index
 
-    row="$(awk -F '\t' -v idx="$index" 'NR == idx { print; exit }' "$NAMES_FILE")"
+    row="$(awk -F '\t' -v idx="$index" 'NF >= 5 { count++; if (count == idx) { print; exit } }' "$NAMES_FILE")"
     if [ -z "$row" ]; then
         print_error "没有这个序号：$index"
         return 1
@@ -353,7 +354,7 @@ ensure_xbctl() {
         return 0
     fi
 
-    print_error "未检测到 xbctl。请先执行菜单 1 初始化 xboard-node。"
+    print_error "还没有安装 xboard-node，请先安装并对接一个节点。"
     return 1
 }
 
@@ -484,9 +485,11 @@ edit_selected_binding() {
     read -r -p "Token [留空保留原绑定，仅改菜单记录]: " NEW_TOKEN </dev/tty
     if [ "$SELECTED_KIND" = "node" ]; then
         read_optional_positive_int "节点 ID" "$SELECTED_TARGET_ID" NEW_TARGET_ID
-        read -r -p "节点类型 [${SELECTED_NODE_TYPE:-自动识别}]: " NEW_NODE_TYPE </dev/tty
-        if [ -z "$NEW_NODE_TYPE" ] || [ "$NEW_NODE_TYPE" = "自动识别" ]; then
+        read -r -p "节点类型 [${SELECTED_NODE_TYPE:-自动识别}，输入 none 清空]: " NEW_NODE_TYPE </dev/tty
+        if [ -z "$NEW_NODE_TYPE" ]; then
             NEW_NODE_TYPE="$SELECTED_NODE_TYPE"
+        elif [ "$NEW_NODE_TYPE" = "none" ] || [ "$NEW_NODE_TYPE" = "NONE" ] || [ "$NEW_NODE_TYPE" = "清空" ]; then
+            NEW_NODE_TYPE=""
         fi
     else
         read_optional_positive_int "机器 ID" "$SELECTED_TARGET_ID" NEW_TARGET_ID
@@ -559,7 +562,10 @@ edit_selected_binding() {
 
 remove_binding_advanced() {
     ensure_xbctl || return 1
+    local delete_kind=""
+    local delete_id=""
 
+    print_info "=== 删除指定节点 ==="
     echo "1. 节点"
     echo "2. 机器"
     echo "0. 返回"
@@ -569,11 +575,15 @@ remove_binding_advanced() {
         1)
             read_required "面板地址: " PANEL
             read_positive_int "节点 ID: " NODE_ID
+            delete_kind="node"
+            delete_id="$NODE_ID"
             remove_binding_raw "node" "$PANEL" "$NODE_ID"
             ;;
         2)
             read_required "面板地址: " PANEL
             read_positive_int "机器 ID: " MACHINE_ID
+            delete_kind="machine"
+            delete_id="$MACHINE_ID"
             remove_binding_raw "machine" "$PANEL" "$MACHINE_ID"
             ;;
         0)
@@ -586,6 +596,9 @@ remove_binding_advanced() {
     esac
 
     if [ $? -eq 0 ]; then
+        if [ -n "$delete_kind" ] && [ -n "$delete_id" ]; then
+            forget_binding "$delete_kind" "$PANEL" "$delete_id"
+        fi
         print_success "绑定已删除。"
         restart_service
         show_instances
@@ -804,15 +817,26 @@ service_menu() {
 
 upgrade_node() {
     if xbctl_exists; then
-        xbctl_cmd upgrade || bash -c "curl -fsSL '$INSTALL_URL' | bash -s -- upgrade"
+        xbctl_cmd upgrade || curl -fsSL "$INSTALL_URL" | bash -s -- upgrade
     else
-        bash -c "curl -fsSL '$INSTALL_URL' | bash -s -- upgrade"
+        curl -fsSL "$INSTALL_URL" | bash -s -- upgrade
     fi
 }
 
 edit_config() {
     if [ -f "$CONFIG_FILE" ]; then
-        "${EDITOR:-nano}" "$CONFIG_FILE" </dev/tty
+        local editor="${EDITOR:-}"
+        if [ -z "$editor" ]; then
+            if command -v nano >/dev/null 2>&1; then
+                editor="nano"
+            elif command -v vi >/dev/null 2>&1; then
+                editor="vi"
+            else
+                print_error "未找到 nano 或 vi，无法编辑配置文件。"
+                return 1
+            fi
+        fi
+        "$editor" "$CONFIG_FILE" </dev/tty
         print_warn "配置修改后请重启服务。"
     else
         print_error "配置文件不存在：$CONFIG_FILE"
@@ -820,29 +844,51 @@ edit_config() {
 }
 
 uninstall_node() {
-    print_warn "即将卸载 xboard-node。"
-    print_warn "默认会保留 /etc/xboard-node 配置；选择 purge 才会彻底删除配置。"
-    read -r -p "确认卸载？[y/N]: " confirm </dev/tty
+    print_warn "即将彻底卸载 xboard-node。"
+    print_warn "将删除服务、程序、xbctl、配置目录和本脚本节点列表。"
+    read -r -p "确认彻底卸载？[y/N]: " confirm </dev/tty
 
     if ! [[ "$confirm" =~ ^[Yy]$ ]]; then
         print_warn "已取消卸载。"
         return 0
     fi
 
-    read -r -p "是否同时删除配置目录 /etc/xboard-node？[y/N]: " purge </dev/tty
-
     if xbctl_exists; then
-        if [[ "$purge" =~ ^[Yy]$ ]]; then
-            xbctl_cmd uninstall --purge --yes
-        else
-            xbctl_cmd uninstall --yes
-        fi
+        xbctl_cmd uninstall --purge --yes || true
     else
-        local args=(uninstall --yes)
-        if [[ "$purge" =~ ^[Yy]$ ]]; then
-            args+=(--purge)
-        fi
-        curl -fsSL "$INSTALL_URL" | bash -s -- "${args[@]}"
+        curl -fsSL "$INSTALL_URL" | bash -s -- uninstall --purge --yes || true
+    fi
+
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    systemctl disable sing-box >/dev/null 2>&1 || true
+    systemctl stop xray >/dev/null 2>&1 || true
+    systemctl disable xray >/dev/null 2>&1 || true
+
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    rm -f /etc/systemd/system/sing-box.service
+    rm -f /etc/systemd/system/xray.service
+    rm -f /usr/local/bin/xboard-node
+    rm -f /usr/local/bin/xbctl
+    rm -f /usr/bin/xboard-node
+    rm -f /usr/bin/xbctl
+    rm -rf /etc/xboard-node
+    rm -rf /var/lib/xboard-node
+    rm -rf /var/log/xboard-node
+    rm -rf /usr/local/etc/xboard-node
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl reset-failed sing-box >/dev/null 2>&1 || true
+    systemctl reset-failed xray >/dev/null 2>&1 || true
+
+    hash -r
+
+    if xbctl_exists || service_exists || [ -d /etc/xboard-node ]; then
+        print_warn "已执行清理，但仍检测到残留，请手动检查 /etc/xboard-node、xbctl 或 systemd 服务。"
+    else
+        print_success "xboard-node 已彻底卸载干净。"
     fi
 }
 
@@ -885,20 +931,37 @@ bindings_menu() {
     while true; do
         clear
         echo -e "${CYAN}====== 节点列表 ======${NC}"
-        print_managed_bindings || true
+        local has_nodes=1
+        print_managed_bindings && has_nodes=0 || has_nodes=1
         echo ""
-        echo "1. 选择节点"
-        echo "2. 查看服务记录"
+        if [ "$has_nodes" -eq 0 ]; then
+            echo "1. 选择节点"
+            echo "2. 查看服务记录"
+        else
+            echo "1. 添加节点"
+            echo "2. 同步已有节点"
+            echo "3. 查看服务记录"
+        fi
         echo "0. 返回"
         echo -e "${CYAN}==================${NC}"
         read -r -p "选择: " choice </dev/tty
 
-        case "$choice" in
-            1) manage_one_binding ;;
-            2) show_instances; pause ;;
-            0) return 0 ;;
-            *) print_error "无效选择。"; pause ;;
-        esac
+        if [ "$has_nodes" -eq 0 ]; then
+            case "$choice" in
+                1) manage_one_binding ;;
+                2) show_instances; pause ;;
+                0) return 0 ;;
+                *) print_error "无效选择。"; pause ;;
+            esac
+        else
+            case "$choice" in
+                1) add_bind_menu ;;
+                2) record_existing_binding; pause ;;
+                3) show_instances; pause ;;
+                0) return 0 ;;
+                *) print_error "无效选择。"; pause ;;
+            esac
+        fi
     done
 }
 
@@ -910,7 +973,7 @@ maintenance_menu() {
         echo "2. 删除指定节点"
         echo "3. 修改配置文件"
         echo "4. 更新程序"
-        echo "5. 卸载程序"
+        echo "5. 彻底卸载"
         echo "6. 帮助说明"
         echo "0. 返回"
         echo -e "${CYAN}==================${NC}"
@@ -931,13 +994,29 @@ maintenance_menu() {
 
 show_menu() {
     clear
-    echo -e "${BLUE}====== Xboard-Node ======${NC}"
+    echo -e "${BLUE}=======================================${NC}"
+    echo -e "        🚀 Xboard-Node 管理面板"
+    echo -e "${BLUE}=======================================${NC}"
+
+    if ! xbctl_exists; then
+        echo "当前状态：未安装"
+        echo ""
+        echo "1. 安装并对接节点"
+        echo "2. 安装并对接机器"
+        echo "0. 退出"
+        echo -e "${BLUE}=======================================${NC}"
+        read -r -p "选择: " choice </dev/tty
+        return 0
+    fi
+
+    echo "当前状态：已安装"
+    echo ""
     echo "1. 节点列表"
     echo "2. 添加节点"
     echo "3. 状态与日志"
     echo "4. 更多操作"
     echo "0. 退出"
-    echo -e "${BLUE}=========================${NC}"
+    echo -e "${BLUE}=======================================${NC}"
     read -r -p "选择: " choice </dev/tty
 }
 
@@ -948,14 +1027,23 @@ main_menu() {
     while true; do
         show_menu
 
-        case "$choice" in
-            1) bindings_menu ;;
-            2) add_bind_menu ;;
-            3) service_menu ;;
-            4) maintenance_menu ;;
-            0) exit 0 ;;
-            *) print_error "无效选择。"; pause ;;
-        esac
+        if ! xbctl_exists; then
+            case "$choice" in
+                1) install_first_node; pause ;;
+                2) install_machine_mode; pause ;;
+                0) exit 0 ;;
+                *) print_error "无效选择。"; pause ;;
+            esac
+        else
+            case "$choice" in
+                1) bindings_menu ;;
+                2) add_bind_menu ;;
+                3) service_menu ;;
+                4) maintenance_menu ;;
+                0) exit 0 ;;
+                *) print_error "无效选择。"; pause ;;
+            esac
+        fi
     done
 }
 
@@ -965,7 +1053,7 @@ case "${1:-menu}" in
     install-machine) require_root; install_machine_mode ;;
     add-node) require_root; add_node_binding ;;
     add-machine) require_root; add_machine_binding ;;
-    list) show_instances ;;
+    list) require_root; show_instances ;;
     status) show_status ;;
     logs) show_logs ;;
     restart) require_root; restart_service ;;

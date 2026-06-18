@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Xboard-Node multi-instance manager.
 # One machine can bind multiple Xboard node IDs through a single xboard-node service.
+# Fixed: avoid Bash local-variable shadowing in read_* helpers; improve panel/node-type validation.
 
 set -o pipefail
 
@@ -27,8 +28,9 @@ pause() {
 }
 
 require_tty() {
-    if [ ! -t 0 ] && [ ! -c /dev/tty ]; then
-        print_error "当前环境没有可交互的 TTY，无法显示菜单。"
+    # /dev/tty 可能存在但当前进程没有控制终端，所以这里用真实打开测试。
+    if ! : </dev/tty 2>/dev/null; then
+        print_error "当前环境没有可交互的 TTY，无法显示菜单。请直接在 SSH 终端里运行。"
         exit 1
     fi
 }
@@ -75,56 +77,76 @@ service_exists() {
 read_required() {
     local prompt="$1"
     local var_name="$2"
-    local value=""
+    local __xb_read_required_value=""
 
-    while [ -z "$value" ]; do
-        read -r -p "$prompt" value </dev/tty
-        if [ -z "$value" ]; then
+    while [ -z "$__xb_read_required_value" ]; do
+        read -r -p "$prompt" __xb_read_required_value </dev/tty
+        if [ -z "$__xb_read_required_value" ]; then
             print_warn "不能为空，请重新输入。"
         fi
     done
 
-    printf -v "$var_name" '%s' "$value"
+    printf -v "$var_name" '%s' "$__xb_read_required_value"
+}
+
+validate_panel_url() {
+    local input_value="$1"
+    [[ "$input_value" =~ ^https?:// ]] || return 1
+    [[ "$input_value" != *$'	'* ]] || return 1
+    [[ "$input_value" != *"#"* ]] || return 1
+    return 0
+}
+
+read_panel_url() {
+    local prompt="$1"
+    local var_name="$2"
+    local input_value=""
+
+    while true; do
+        read_required "$prompt" input_value
+        if validate_panel_url "$input_value"; then
+            printf -v "$var_name" '%s' "$input_value"
+            return 0
+        fi
+        print_warn "面板地址必须以 http:// 或 https:// 开头，且不能包含 Tab 或 #。"
+        input_value=""
+    done
 }
 
 read_panel_token() {
-    read_required "面板地址: " PANEL
+    read_panel_url "面板地址: " PANEL
     read_required "Token: " TOKEN
-
-    if ! [[ "$PANEL" =~ ^https?:// ]]; then
-        print_error "面板地址必须以 http:// 或 https:// 开头。"
-        return 1
-    fi
 }
 
 read_positive_int() {
     local prompt="$1"
     local var_name="$2"
-    local value=""
+    local input_value=""
 
     while true; do
-        read_required "$prompt" value
-        if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
-            printf -v "$var_name" '%s' "$value"
+        read_required "$prompt" input_value
+        if [[ "$input_value" =~ ^[0-9]+$ ]] && [ "$input_value" -gt 0 ]; then
+            printf -v "$var_name" '%s' "$input_value"
             return 0
         fi
         print_warn "请输入大于 0 的数字。"
+        input_value=""
     done
 }
 
 read_label() {
     local prompt="$1"
     local var_name="$2"
-    local value=""
+    local input_value=""
 
     while true; do
-        read_required "$prompt" value
-        if [[ "$value" == *$'\t'* || "$value" == *"#"* ]]; then
+        read_required "$prompt" input_value
+        if [[ "$input_value" == *$'	'* || "$input_value" == *"#"* ]]; then
             print_warn "名称不能包含 Tab 或 #，请换一个。"
-            value=""
+            input_value=""
             continue
         fi
-        printf -v "$var_name" '%s' "$value"
+        printf -v "$var_name" '%s' "$input_value"
         return 0
     done
 }
@@ -133,59 +155,61 @@ read_optional() {
     local prompt="$1"
     local default_value="$2"
     local var_name="$3"
-    local value=""
+    local __xb_read_optional_value=""
 
-    read -r -p "$prompt [$default_value]: " value </dev/tty
-    if [ -z "$value" ]; then
-        value="$default_value"
+    read -r -p "$prompt [$default_value]: " __xb_read_optional_value </dev/tty
+    if [ -z "$__xb_read_optional_value" ]; then
+        __xb_read_optional_value="$default_value"
     fi
 
-    if [[ "$value" == *$'\t'* || "$value" == *"#"* ]]; then
+    if [[ "$__xb_read_optional_value" == *$'	'* || "$__xb_read_optional_value" == *"#"* ]]; then
         print_warn "不能包含 Tab 或 #。"
         return 1
     fi
 
-    printf -v "$var_name" '%s' "$value"
+    printf -v "$var_name" '%s' "$__xb_read_optional_value"
 }
 
 read_optional_positive_int() {
     local prompt="$1"
     local default_value="$2"
     local var_name="$3"
-    local value=""
+    local input_value=""
 
     while true; do
-        read -r -p "$prompt [$default_value]: " value </dev/tty
-        if [ -z "$value" ]; then
-            value="$default_value"
+        read -r -p "$prompt [$default_value]: " input_value </dev/tty
+        if [ -z "$input_value" ]; then
+            input_value="$default_value"
         fi
-        if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
-            printf -v "$var_name" '%s' "$value"
+        if [[ "$input_value" =~ ^[0-9]+$ ]] && [ "$input_value" -gt 0 ]; then
+            printf -v "$var_name" '%s' "$input_value"
             return 0
         fi
         print_warn "请输入大于 0 的数字。"
+        input_value=""
     done
 }
 
 read_optional_panel() {
     local default_value="$1"
     local var_name="$2"
-    local value=""
+    local input_value=""
 
     while true; do
-        read_optional "面板地址" "$default_value" value || continue
-        if [[ "$value" =~ ^https?:// ]]; then
-            printf -v "$var_name" '%s' "$value"
+        read_optional "面板地址" "$default_value" input_value || continue
+        if validate_panel_url "$input_value"; then
+            printf -v "$var_name" '%s' "$input_value"
             return 0
         fi
-        print_warn "面板地址必须以 http:// 或 https:// 开头。"
+        print_warn "面板地址必须以 http:// 或 https:// 开头，且不能包含 Tab 或 #。"
+        input_value=""
     done
 }
 
 read_kernel() {
-    local value=""
-    read -r -p "内核 [singbox/xray，默认 singbox]: " value </dev/tty
-    case "$value" in
+    local input_value=""
+    read -r -p "内核 [singbox/xray，默认 singbox]: " input_value </dev/tty
+    case "$input_value" in
         ""|singbox|SingBox|SINGBOX)
             KERNEL="singbox"
             ;;
@@ -202,14 +226,14 @@ read_kernel() {
 read_optional_kernel() {
     local default_value="$1"
     local var_name="$2"
-    local value=""
+    local input_value=""
 
-    read -r -p "内核 [$default_value]: " value </dev/tty
-    if [ -z "$value" ]; then
-        value="$default_value"
+    read -r -p "内核 [$default_value]: " input_value </dev/tty
+    if [ -z "$input_value" ]; then
+        input_value="$default_value"
     fi
 
-    case "$value" in
+    case "$input_value" in
         singbox|SingBox|SINGBOX)
             printf -v "$var_name" '%s' "singbox"
             ;;
@@ -223,9 +247,23 @@ read_optional_kernel() {
     esac
 }
 
+read_optional_node_type() {
+    local prompt="$1"
+    local var_name="$2"
+    local input_value=""
+
+    read -r -p "$prompt" input_value </dev/tty
+    if [[ "$input_value" == *$'	'* || "$input_value" == *"#"* ]]; then
+        print_warn "节点类型不能包含 Tab 或 #，已留空。"
+        input_value=""
+    fi
+
+    printf -v "$var_name" '%s' "$input_value"
+}
+
 ensure_state_dir() {
-    mkdir -p "$(dirname "$NAMES_FILE")"
-    touch "$NAMES_FILE"
+    mkdir -p "$(dirname "$NAMES_FILE")" || return 1
+    touch "$NAMES_FILE" || return 1
 }
 
 remember_binding() {
@@ -365,12 +403,14 @@ add_node_binding_raw() {
     local kernel="$4"
     local node_type="${5:-}"
     local args=(bind add-node --panel-url "$panel" --token "$token" --node-id "$node_id" --kernel "$kernel")
+    local fallback_args=(bind add-node --panel "$panel" --token "$token" --node-id "$node_id" --kernel "$kernel")
 
     if [ -n "$node_type" ]; then
         args+=(--node-type "$node_type")
+        fallback_args+=(--node-type "$node_type")
     fi
 
-    xbctl_cmd "${args[@]}" || xbctl_cmd bind add-node --panel "$panel" --token "$token" --node-id "$node_id" --kernel "$kernel"
+    xbctl_cmd "${args[@]}" || xbctl_cmd "${fallback_args[@]}"
 }
 
 add_machine_binding_raw() {
@@ -412,7 +452,7 @@ add_node_binding() {
     read_positive_int "节点 ID: " NODE_ID
     read_kernel
 
-    read -r -p "节点类型，可留空: " NODE_TYPE </dev/tty
+    read_optional_node_type "节点类型，可留空: " NODE_TYPE
 
     if add_node_binding_raw "$PANEL" "$TOKEN" "$NODE_ID" "$KERNEL" "$NODE_TYPE"; then
         remember_binding "$LABEL" "node" "$PANEL" "$NODE_ID" "$KERNEL" "$NODE_TYPE"
@@ -480,7 +520,7 @@ edit_selected_binding() {
     echo ""
     print_info "直接回车表示保留原值。"
     read_optional "名称" "$SELECTED_LABEL" NEW_LABEL || return 1
-    read_optional_panel "$SELECTED_PANEL" NEW_PANEL
+    read_optional_panel "$SELECTED_PANEL" NEW_PANEL || return 1
 
     read -r -p "Token [留空保留原绑定，仅改菜单记录]: " NEW_TOKEN </dev/tty
     if [ "$SELECTED_KIND" = "node" ]; then
@@ -490,6 +530,9 @@ edit_selected_binding() {
             NEW_NODE_TYPE="$SELECTED_NODE_TYPE"
         elif [ "$NEW_NODE_TYPE" = "none" ] || [ "$NEW_NODE_TYPE" = "NONE" ] || [ "$NEW_NODE_TYPE" = "清空" ]; then
             NEW_NODE_TYPE=""
+        elif [[ "$NEW_NODE_TYPE" == *$'\t'* || "$NEW_NODE_TYPE" == *"#"* ]]; then
+            print_warn "节点类型不能包含 Tab 或 #，已保留原值。"
+            NEW_NODE_TYPE="$SELECTED_NODE_TYPE"
         fi
     else
         read_optional_positive_int "机器 ID" "$SELECTED_TARGET_ID" NEW_TARGET_ID
@@ -573,14 +616,14 @@ remove_binding_advanced() {
 
     case "$remove_choice" in
         1)
-            read_required "面板地址: " PANEL
+            read_panel_url "面板地址: " PANEL
             read_positive_int "节点 ID: " NODE_ID
             delete_kind="node"
             delete_id="$NODE_ID"
             remove_binding_raw "node" "$PANEL" "$NODE_ID"
             ;;
         2)
-            read_required "面板地址: " PANEL
+            read_panel_url "面板地址: " PANEL
             read_positive_int "机器 ID: " MACHINE_ID
             delete_kind="machine"
             delete_id="$MACHINE_ID"
@@ -627,7 +670,7 @@ record_existing_binding() {
         1)
             KIND="node"
             read_positive_int "节点 ID: " TARGET_ID
-            read -r -p "节点类型，可留空: " NODE_TYPE </dev/tty
+            read_optional_node_type "节点类型，可留空: " NODE_TYPE
             ;;
         2)
             KIND="machine"
@@ -640,7 +683,7 @@ record_existing_binding() {
             ;;
     esac
 
-    read_required "面板地址: " PANEL
+    read_panel_url "面板地址: " PANEL
     read_kernel
     remember_binding "$LABEL" "$KIND" "$PANEL" "$TARGET_ID" "$KERNEL" "$NODE_TYPE"
 
@@ -737,26 +780,38 @@ manage_one_binding() {
 }
 
 restart_service() {
-    if xbctl_exists; then
-        xbctl_cmd service restart || systemctl restart "$SERVICE_NAME"
-    else
+    if xbctl_exists && xbctl_cmd service restart; then
+        return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
         systemctl restart "$SERVICE_NAME"
+    else
+        print_error "未检测到 systemctl，无法重启服务。"
+        return 1
     fi
 }
 
 start_service() {
-    if xbctl_exists; then
-        xbctl_cmd service start || systemctl start "$SERVICE_NAME"
-    else
+    if xbctl_exists && xbctl_cmd service start; then
+        return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
         systemctl start "$SERVICE_NAME"
+    else
+        print_error "未检测到 systemctl，无法启动服务。"
+        return 1
     fi
 }
 
 stop_service() {
-    if xbctl_exists; then
-        xbctl_cmd service stop || systemctl stop "$SERVICE_NAME"
-    else
+    if xbctl_exists && xbctl_cmd service stop; then
+        return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
         systemctl stop "$SERVICE_NAME"
+    else
+        print_error "未检测到 systemctl，无法停止服务。"
+        return 1
     fi
 }
 
@@ -771,12 +826,14 @@ show_status() {
 }
 
 show_logs() {
-    if xbctl_exists; then
-        xbctl_cmd service logs
-    elif service_exists; then
+    if xbctl_exists && xbctl_cmd service logs; then
+        return 0
+    fi
+    if service_exists; then
         journalctl -u "$SERVICE_NAME" -f </dev/tty
     else
         print_error "${SERVICE_NAME} 服务不存在。"
+        return 1
     fi
 }
 
@@ -1049,13 +1106,13 @@ main_menu() {
 
 case "${1:-menu}" in
     menu) main_menu ;;
-    install) require_root; install_first_node ;;
-    install-machine) require_root; install_machine_mode ;;
-    add-node) require_root; add_node_binding ;;
-    add-machine) require_root; add_machine_binding ;;
+    install) require_tty; require_root; install_first_node ;;
+    install-machine) require_tty; require_root; install_machine_mode ;;
+    add-node) require_tty; require_root; add_node_binding ;;
+    add-machine) require_tty; require_root; add_machine_binding ;;
     list) require_root; show_instances ;;
     status) show_status ;;
-    logs) show_logs ;;
+    logs) require_tty; show_logs ;;
     restart) require_root; restart_service ;;
     help|-h|--help) show_help ;;
     *) print_error "未知命令：$1"; show_help; exit 1 ;;
